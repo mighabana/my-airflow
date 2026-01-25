@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/_common.sh"
+
+log_info "Installing K3s..."
+
+# Check if K3s is already installed
+if command -v k3s &> /dev/null; then
+    log_warn "K3s is already installed"
+    k3s --version
+    read -p "Reinstall? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "Skipping K3s installation"
+        exit 0
+    fi
+    log_info "Uninstalling existing K3s..."
+    /usr/local/bin/k3s-uninstall.sh 2>/dev/null || true
+fi
+
+# Install K3s
+log_info "Installing K3s with relaxed kubeconfig permissions..."
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik" sh -
+
+# Wait for K3s to be ready
+log_info "Waiting for K3s to be ready..."
+sleep 5
+
+# Setup kubeconfig for current user
+log_info "Setting up kubeconfig..."
+mkdir -p "${HOME}/.kube"
+sudo cp /etc/rancher/k3s/k3s.yaml "${HOME}/.kube/config"
+sudo chown "$(id -u):$(id -g)" "${HOME}/.kube/config"
+
+export KUBECONFIG="${HOME}/.kube/config"
+
+# Verify installation
+log_info "Verifying K3s installation..."
+kubectl get nodes
+
+# Add KUBECONFIG to shell profile if not present
+SHELL_RC="${HOME}/.bashrc"
+if [[ -f "${HOME}/.zshrc" ]]; then
+    SHELL_RC="${HOME}/.zshrc"
+fi
+
+if ! grep -q "KUBECONFIG" "${SHELL_RC}" 2>/dev/null; then
+    echo 'export KUBECONFIG="${HOME}/.kube/config"' >> "${SHELL_RC}"
+    log_info "Added KUBECONFIG to ${SHELL_RC}"
+fi
+
+log_success "K3s installed successfully!"
+log_info "Run 'source ${SHELL_RC}' or start a new terminal to use kubectl"

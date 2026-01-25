@@ -1,12 +1,40 @@
-# environment variables
+# Environment files with secrets
 .env
 .envrc
 
-# Python
-.venv
+# Local Helm overrides
+helm/values.local.yaml
 
-# Volumes
-logs/*
-!logs/.gitkeep
-postgres_data/*
-!postgres_data/.gitkeep
+# Volumes directory (local persistent storage)
+volumes/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.eggs/
+*.egg-info/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Generated files
+helm/values.generated.yaml
+
+# Note: config/webserver_config.py is tracked by git (it's a template)
+# If you add secrets to it, consider using environment variables instead

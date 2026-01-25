@@ -1,0 +1,93 @@
+---
+# Persistent Volume for DAGs
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: airflow-dags-pv
+  labels:
+    app: airflow
+    component: dags
+    type: local
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: ${AIRFLOW_NAMESPACE}
+    name: airflow-dags-pvc
+  hostPath:
+    path: ${VOLUMES_PATH}/dags
+    type: DirectoryOrCreate
+
+---
+# Persistent Volume Claim for DAGs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-dags-pvc
+  namespace: ${AIRFLOW_NAMESPACE}
+  labels:
+    app: airflow
+    component: dags
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 5Gi
+  selector:
+    matchLabels:
+      app: airflow
+      component: dags
+      type: local
+
+---
+# Persistent Volume for Logs
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: airflow-logs-pv
+  labels:
+    app: airflow
+    component: logs
+    type: local
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: ${AIRFLOW_NAMESPACE}
+    name: airflow-logs-pvc
+  hostPath:
+    path: ${VOLUMES_PATH}/logs
+    type: DirectoryOrCreate
+
+---
+# Persistent Volume Claim for Logs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-logs-pvc
+  namespace: ${AIRFLOW_NAMESPACE}
+  labels:
+    app: airflow
+    component: logs
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 10Gi
+  selector:
+    matchLabels:
+      app: airflow
+      component: logs
+      type: local

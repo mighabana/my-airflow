@@ -1,0 +1,157 @@
+# Compatible with Airflow 3.x
+
+# Executor configuration
+executor: "KubernetesExecutor"
+
+# Airflow image
+defaultAirflowRepository: apache/airflow
+defaultAirflowTag: "${AIRFLOW_VERSION}"
+
+# Authentication
+webserverSecretKey: "${WEBSERVER_SECRET_KEY}"
+
+# ------------------------------------------------------------------------------
+# Airflow 3.x uses API Server instead of Webserver for the UI
+# ------------------------------------------------------------------------------
+
+# API Server (replaces webserver in Airflow 3.x)
+apiServer:
+  replicas: 1
+  resources:
+    requests:
+      memory: "${WEBSERVER_MEMORY_REQUEST}"
+      cpu: "500m"
+    limits:
+      memory: "${WEBSERVER_MEMORY_LIMIT}"
+      cpu: "1000m"
+  service:
+    type: NodePort
+    ports:
+      - name: api-server
+        port: 8080
+        targetPort: 8080
+        nodePort: ${WEBSERVER_PORT}
+
+# Default admin user
+defaultUser:
+  enabled: true
+  role: Admin
+  username: admin
+  email: admin@example.com
+  firstName: Admin
+  lastName: User
+  password: admin
+
+# Webserver (disabled in Airflow 3.x - kept for reference)
+webserver:
+  enabled: false
+
+# Scheduler
+scheduler:
+  replicas: 1
+  resources:
+    requests:
+      memory: "${SCHEDULER_MEMORY_REQUEST}"
+      cpu: "500m"
+    limits:
+      memory: "${SCHEDULER_MEMORY_LIMIT}"
+      cpu: "1000m"
+
+# Dag Processor (separate component in Airflow 3.x)
+dagProcessor:
+  enabled: true
+  replicas: 1
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+# Triggerer (for deferrable operators)
+triggerer:
+  enabled: true
+  replicas: 1
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+# PostgreSQL (bundled - disabled, we use external)
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: "${POSTGRES_PASSWORD}"
+    username: airflow
+    password: "${POSTGRES_PASSWORD}"
+    database: airflow
+  primary:
+    persistence:
+      enabled: true
+      size: 8Gi
+
+# Redis disabled (not needed for KubernetesExecutor)
+redis:
+  enabled: false
+
+# DAGs configuration
+dags:
+  persistence:
+    enabled: true
+    existingClaim: airflow-dags-pvc
+  gitSync:
+    enabled: false
+
+# Logs
+logs:
+  persistence:
+    enabled: true
+    existingClaim: airflow-logs-pvc
+
+# Disable Helm hooks for user creation (causes issues with upgrades)
+createUserJob:
+  useHelmHooks: false
+migrateDatabaseJob:
+  useHelmHooks: false
+
+# Airflow configuration
+config:
+  core:
+    load_examples: "False"
+    dags_folder: "/opt/airflow/dags"
+    default_timezone: "UTC"
+  api:
+    # Airflow 3.x API settings
+    enable_experimental_api: "False"
+  scheduler:
+    dag_dir_list_interval: "30"
+    min_file_process_interval: "30"
+  logging:
+    remote_logging: "False"
+
+# Environment variables
+env:
+  - name: AIRFLOW__CORE__FERNET_KEY
+    value: "${FERNET_KEY}"
+  - name: AIRFLOW__WEBSERVER__SECRET_KEY
+    value: "${WEBSERVER_SECRET_KEY}"
+
+# Pod annotations
+airflowPodAnnotations:
+  cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+
+# Flower disabled (not used with KubernetesExecutor)
+flower:
+  enabled: false
+
+# StatsD disabled by default
+statsd:
+  enabled: false
+
+# PgBouncer disabled (not needed for single node)
+pgbouncer:
+  enabled: false

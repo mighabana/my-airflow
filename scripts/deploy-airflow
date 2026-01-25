@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/_common.sh"
+
+# Parse arguments
+DAGS_ONLY=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dags-only)
+            DAGS_ONLY=true
+            shift
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Load environment
+load_env
+
+# If just syncing DAGs, do that and exit
+if [[ "$DAGS_ONLY" == "true" ]]; then
+    log_info "Syncing DAGs only..."
+    if [[ -d "${PROJECT_ROOT}/dags" ]]; then
+        cp -r "${PROJECT_ROOT}/dags/"* "${VOLUMES_PATH}/dags/" 2>/dev/null || true
+        log_success "DAGs synced to ${VOLUMES_PATH}/dags"
+    fi
+    exit 0
+fi
+
+log_info "Starting Airflow deployment..."
+
+# Check prerequisites
+require_command kubectl
+require_command helm
+
+# Verify K3s is running
+if ! kubectl get nodes &>/dev/null; then
+    log_error "Cannot connect to Kubernetes cluster. Is K3s running?"
+    log_info "Run './scripts/install-k3s.sh' first"
+    exit 1
+fi
+
+# Generate secrets if needed
+"${SCRIPT_DIR}/generate-secrets.sh"
+
+# Reload env after secrets generation
+load_env
+
+# Validate required secrets
+if [[ -z "${FERNET_KEY:-}" ]]; then
+    log_error "FERNET_KEY is not set. Run './scripts/generate-secrets.sh'"
+    exit 1
+fi
+
+if [[ -z "${WEBSERVER_SECRET_KEY:-}" ]]; then
+    log_error "WEBSERVER_SECRET_KEY is not set. Run './scripts/generate-secrets.sh'"
+    exit 1
+fi
+
+# Create volumes directories
+log_info "Creating volumes directories..."
+mkdir -p "${VOLUMES_PATH}/dags" "${VOLUMES_PATH}/logs"
+# Use sudo for chmod in case files were created by K8s pods (uid 50000)
+sudo chmod -R 777 "${VOLUMES_PATH}" 2>/dev/null || true
+
+# Create namespace
+log_info "Creating namespace ${AIRFLOW_NAMESPACE}..."
+kubectl create namespace "${AIRFLOW_NAMESPACE}" 2>/dev/null || true
+
+# Apply storage configuration
+log_info "Applying storage configuration..."
+envsubst < "${PROJECT_ROOT}/k8s/storage.yaml" | kubectl apply -f -
+
+# Deploy PostgreSQL if manifest exists and pod isn't ready
+POSTGRES_MANIFEST="${PROJECT_ROOT}/k8s/postgres.yaml"
+if [[ -f "$POSTGRES_MANIFEST" ]]; then
+    log_info "Deploying PostgreSQL..."
+    kubectl apply -f "$POSTGRES_MANIFEST"
+    
+    log_info "Waiting for PostgreSQL to be ready..."
+    kubectl wait --for=condition=ready pod -l app=airflow-postgres -n "${AIRFLOW_NAMESPACE}" --timeout=120s || {
+        log_error "PostgreSQL failed to start. Check logs with: kubectl logs -l app=airflow-postgres -n ${AIRFLOW_NAMESPACE}"
+        exit 1
+    }
+    log_success "PostgreSQL is ready"
+fi
+
+# Add Helm repo
+log_info "Adding Airflow Helm repository..."
+helm repo add apache-airflow https://airflow.apache.org 2>/dev/null || true
+helm repo update
+
+# Clean up any stuck jobs from previous deployments (Jobs are immutable)
+log_info "Cleaning up any stuck jobs..."
+kubectl delete job airflow-create-user airflow-run-airflow-migrations -n "${AIRFLOW_NAMESPACE}" --ignore-not-found 2>/dev/null || true
+
+# Generate final values file
+log_info "Generating Helm values..."
+TEMP_VALUES=$(mktemp)
+envsubst < "${PROJECT_ROOT}/helm/values.yaml" > "$TEMP_VALUES"
+
+# Append webserver_config.py if it exists
+WEBSERVER_CONFIG="${PROJECT_ROOT}/config/webserver_config.py"
+if [[ -f "$WEBSERVER_CONFIG" ]]; then
+    log_info "Adding custom webserver_config.py..."
+    {
+        echo ""
+        echo "# Custom webserver configuration"
+        echo "webserver:"
+        echo "  webserverConfig: |"
+        sed 's/^/    /' "$WEBSERVER_CONFIG"
+    } >> "$TEMP_VALUES"
+fi
+
+# Check for local overrides
+HELM_ARGS=("-f" "$TEMP_VALUES")
+if [[ -f "${PROJECT_ROOT}/helm/values.local.yaml" ]]; then
+    log_info "Including local overrides from helm/values.local.yaml"
+    HELM_ARGS+=("-f" "${PROJECT_ROOT}/helm/values.local.yaml")
+fi
+
+# Install/upgrade Airflow
+log_info "Deploying Airflow (this may take several minutes)..."
+helm upgrade --install airflow apache-airflow/airflow \
+    --namespace "${AIRFLOW_NAMESPACE}" \
+    "${HELM_ARGS[@]}" \
+    --timeout 10m \
+    --wait
+
+# Cleanup temp file
+rm -f "$TEMP_VALUES"
+
+# Copy DAGs
+if [[ -d "${PROJECT_ROOT}/dags" ]] && [[ -n "$(ls -A "${PROJECT_ROOT}/dags" 2>/dev/null)" ]]; then
+    log_info "Copying DAGs to ${VOLUMES_PATH}/dags..."
+    cp -r "${PROJECT_ROOT}/dags/"* "${VOLUMES_PATH}/dags/"
+fi
+
+# Wait for pods
+log_info "Waiting for pods to be ready..."
+sleep 10
+wait_for_pods "${AIRFLOW_NAMESPACE}" 300
+
+# Get status
+log_info "Deployment status:"
+kubectl get pods -n "${AIRFLOW_NAMESPACE}"
+
+# Print access info
+SERVER_IP=$(hostname -I | awk '{print $1}')
+echo ""
+log_success "Airflow deployed successfully!"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Airflow UI: http://${SERVER_IP}:${WEBSERVER_PORT}"
+echo "  Username:   admin"
+echo "  Password:   admin"
+echo ""
+echo "  DAGs path:  ${VOLUMES_PATH}/dags"
+echo "  Logs path:  ${VOLUMES_PATH}/logs"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "Useful commands:"
+echo "  kubectl get pods -n ${AIRFLOW_NAMESPACE}"
+echo "  kubectl logs -f deployment/airflow-scheduler -n ${AIRFLOW_NAMESPACE}"
+echo ""
