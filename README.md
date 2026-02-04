@@ -8,6 +8,7 @@ A portable, repeatable Apache Airflow deployment on K3s (lightweight Kubernetes)
 - **Self-contained** — All persistent data stored in `volumes/` directory within the repo
 - **KubernetesExecutor** — Each task runs in its own pod for isolation and scalability
 - **External PostgreSQL** — Uses official `postgres:16` image instead of Bitnami for reliability
+- **Redis for distributed state** — Fast, in-memory coordination across all Airflow tasks
 - **Customizable** — Easy configuration via environment variables and Helm values
 
 ## Prerequisites
@@ -33,7 +34,10 @@ cp .env.example .env
 # 4. Deploy Airflow
 ./scripts/deploy-airflow
 
-# 5. Access Airflow UI
+# 5. Deploy Redis (for distributed state management)
+./scripts/deploy-redis
+
+# 6. Access Airflow UI
 echo "http://$(hostname -I | awk '{print $1}'):30123"
 # Default credentials: admin / admin
 ```
@@ -44,6 +48,7 @@ echo "http://$(hostname -I | awk '{print $1}'):30123"
 airflow/
 ├── scripts/
 │   ├── deploy-airflow       # Main deployment script
+│   ├── deploy-redis         # Redis deployment script
 │   ├── install-k3s          # K3s installation
 │   ├── teardown             # Clean uninstall
 │   └── lib/
@@ -51,6 +56,7 @@ airflow/
 │       └── generate-secrets.sh
 ├── k8s/
 │   ├── postgres.yaml        # PostgreSQL deployment (official image)
+│   ├── redis.yaml           # Redis deployment (for distributed state management)
 │   └── storage.yaml         # PersistentVolume definitions
 ├── helm/
 │   ├── values.yaml          # Base Helm values (templated)
@@ -97,8 +103,9 @@ extraPipPackages:
   - polars
   - clickhouse-connect
   - apache-airflow-providers-slack
+  - redis  # For distributed state management
 
-# Timezone and concurrency settings  
+# Timezone and concurrency settings
 config:
   core:
     default_timezone: "Europe/Madrid"
@@ -112,6 +119,11 @@ env:
     value: "clickhouse://user:pass@host:8123/db"
   - name: AIRFLOW_CONN_MY_API
     value: "http://apikey@api.example.com"
+  # Redis connection for distributed state
+  - name: REDIS_HOST
+    value: "redis.airflow.svc.cluster.local"
+  - name: REDIS_PORT
+    value: "6379"
 
 # External PostgreSQL (required - disables bundled Bitnami PostgreSQL)
 postgresql:
@@ -143,6 +155,126 @@ OAUTH_PROVIDERS = [...]
 
 See the file for complete examples including LDAP, OAuth, and RBAC configuration.
 
+## Redis for Distributed State Management
+
+Redis provides fast, in-memory state sharing across all Airflow tasks running in separate Docker containers.
+
+### Why Redis?
+
+With KubernetesExecutor, each task runs in its own isolated container. This means:
+- **No shared memory** between tasks
+- **No persistent state** across task executions
+- **File-based sharing is slow** and complex in distributed environments
+
+Redis solves these challenges by providing:
+- **Shared state** accessible from all task containers
+- **< 1ms latency** for read/write operations
+- **Atomic operations** to prevent race conditions
+- **Automatic cleanup** via TTL (Time To Live)
+- **Pub/Sub messaging** for real-time communication
+
+### Common Use Cases
+
+Redis in this Airflow setup can be used for:
+- **Rate limiting** - Track API usage across distributed tasks
+- **Caching** - Store frequently accessed data (exchange rates, API responses)
+- **Coordination** - Synchronize task execution and prevent conflicts
+- **Session storage** - Maintain state across workflow steps
+- **Task queuing** - Implement custom task distribution patterns
+- **Metrics collection** - Gather real-time statistics from running tasks
+
+### Deploy Redis
+
+```bash
+# Deploy Redis to K3s
+./scripts/deploy-redis
+
+# Check Redis status
+./scripts/deploy-redis --status
+
+# Remove Redis (with confirmation)
+./scripts/deploy-redis --teardown
+```
+
+### Redis Connection Info
+
+**From inside cluster (Airflow tasks):**
+```
+Host: redis.airflow.svc.cluster.local
+Port: 6379
+URL:  redis://redis.airflow.svc.cluster.local:6379
+```
+
+**External access (debugging only):**
+```bash
+# Get your node IP
+kubectl get nodes -o wide
+
+# Access via NodePort
+redis-cli -h <node-ip> -p 30379 ping
+```
+
+### Using Redis in Your DAGs
+
+Redis is automatically available to all tasks via environment variables:
+
+```python
+import os
+from redis import Redis
+
+# Connect to Redis
+redis_client = Redis(
+    host=os.getenv("REDIS_HOST"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    decode_responses=True
+)
+
+# Test connection
+redis_client.ping()  # Returns True
+
+# Example: Cache data
+redis_client.setex("exchange_rate_USD_EUR", 3600, "0.92")  # Cache for 1 hour
+rate = redis_client.get("exchange_rate_USD_EUR")
+
+# Example: Atomic counter
+redis_client.incr("api_calls_today")
+count = redis_client.get("api_calls_today")
+
+# Example: Set with expiration
+redis_client.setex("session:user123", 1800, "active")  # 30 minutes
+
+# Example: Pub/Sub messaging
+redis_client.publish("task_notifications", "Task completed")
+```
+
+Your data pipeline utilities can automatically leverage Redis for various distributed coordination needs when the environment variables are set.
+
+### Monitoring Redis
+
+```bash
+# View Redis logs
+kubectl logs -f deployment/redis -n airflow
+
+# Connect to Redis CLI
+kubectl exec -it deployment/redis -n airflow -- redis-cli
+
+# Check Redis stats
+kubectl exec deployment/redis -n airflow -- redis-cli INFO stats
+
+# View rate limit keys
+kubectl exec deployment/redis -n airflow -- redis-cli KEYS "*rate_limit*"
+```
+
+### Redis Resources
+
+Default configuration:
+- **Memory**: 128Mi request, 512Mi limit
+- **CPU**: 100m request, 500m limit
+- **Storage**: 1Gi PVC for persistence
+- **Persistence**: Enabled (saves snapshots)
+
+To adjust resources, edit `k8s/redis.yaml` and redeploy.
+
 ## Commands Reference
 
 ### Deployment
@@ -150,6 +282,9 @@ See the file for complete examples including LDAP, OAuth, and RBAC configuration
 ```bash
 # Full deployment (creates namespace, PVs, PostgreSQL, Airflow)
 ./scripts/deploy-airflow
+
+# Deploy Redis for state management
+./scripts/deploy-redis
 
 # Sync DAGs only (fast, no Helm upgrade)
 ./scripts/deploy-airflow --dags-only
@@ -183,6 +318,9 @@ kubectl logs -f deployment/airflow-scheduler -n airflow
 # View webserver logs
 kubectl logs -f deployment/airflow-webserver -n airflow
 
+# View Redis logs
+kubectl logs -f deployment/redis -n airflow
+
 # Shell into a pod
 kubectl exec -it deployment/airflow-scheduler -n airflow -- bash
 
@@ -212,6 +350,7 @@ kubectl exec -it deployment/airflow-scheduler -n airflow -- airflow dags reseria
 # Restart components after config changes
 kubectl rollout restart deployment/airflow-webserver -n airflow
 kubectl rollout restart deployment/airflow-scheduler -n airflow
+kubectl rollout restart deployment/redis -n airflow
 
 # Check resource usage
 kubectl top pods -n airflow
@@ -344,6 +483,24 @@ kubectl logs deployment/airflow-postgres -n airflow
 kubectl rollout restart deployment/airflow-postgres -n airflow
 ```
 
+### Redis connection issues
+
+```bash
+# Test Redis connectivity
+kubectl run redis-test --rm -i --tty \
+  --image redis:7.4-alpine \
+  -n airflow \
+  -- redis-cli -h redis.airflow.svc.cluster.local ping
+
+# Should return: PONG
+
+# Check Redis logs
+kubectl logs deployment/redis -n airflow
+
+# Restart Redis
+kubectl rollout restart deployment/redis -n airflow
+```
+
 ### Helm upgrade failures
 
 If you see "Job is immutable" errors:
@@ -398,15 +555,95 @@ kubectl describe pod <pod-name> -n airflow
 │  │                       │                                 ││
 │  │        ┌──────────────┼──────────────┐                  ││
 │  │        ▼              ▼              ▼                  ││
+<<<<<<< Updated upstream
 │  │  ┌───────────┐  ┌───────────┐  ┌───────────┐            ││
 │  │  │ DAGs PVC  │  │ Logs PVC  │  │Postgres PVC│           ││
 │  │  └───────────┘  └───────────┘  └───────────┘            ││
+||||||| Stash base
+│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐           ││
+│  │  │ DAGs PVC  │  │ Logs PVC  │  │Postgres PVC│          ││
+│  │  └───────────┘  └───────────┘  └───────────┘           ││
+=======
+│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐           ││
+│  │  │ DAGs PVC  │  │ Logs PVC  │  │Postgres PVC│          ││
+│  │  └───────────┘  └───────────┘  └───────────┘           ││
+│  │                                                         ││
+│  │  ┌────────────────────────────────────────────┐        ││
+│  │  │         Task Pods (KubernetesExecutor)     │        ││
+│  │  │  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐   │        ││
+│  │  │  │Task 1│  │Task 2│  │Task 3│  │Task N│   │        ││
+│  │  │  └───┬──┘  └───┬──┘  └───┬──┘  └───┬──┘   │        ││
+│  │  └──────┼─────────┼─────────┼─────────┼───────┘        ││
+│  │         │         │         │         │                ││
+│  │         └─────────┴─────────┴─────────┘                ││
+│  │                       │                                 ││
+│  │                       ▼                                 ││
+│  │            ┌─────────────────────┐                      ││
+│  │            │     Redis           │                      ││
+│  │            │  (Shared State)     │                      ││
+│  │            │  - Port: 6379       │                      ││
+│  │            │  - Memory: 512Mi    │                      ││
+│  │            └──────────┬──────────┘                      ││
+│  │                       │                                 ││
+│  │                       ▼                                 ││
+│  │            ┌─────────────────────┐                      ││
+│  │            │   Redis PVC (1Gi)   │                      ││
+│  │            └─────────────────────┘                      ││
+>>>>>>> Stashed changes
 │  └─────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────┘
          │                 │
          ▼                 ▼
    ./volumes/dags    ./volumes/logs
 ```
+
+## Data Flow with Redis
+
+Redis acts as a fast, persistent data store that enables real-time coordination between distributed tasks:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    General Pattern                           │
+└─────────────────────────────────────────────────────────────┘
+
+Airflow Task (Docker Container)
+    │
+    ├─> Read shared state from Redis
+    │   └─> Check counters, flags, cached data (< 1ms)
+    │
+    ├─> Execute business logic
+    │   └─> API calls, data processing, transformations
+    │
+    └─> Write results to Redis
+        └─> Update counters, set flags, cache results
+            │
+            ▼
+    Other Tasks can immediately access this state
+```
+
+### Example: API Rate Limiting
+
+A common use case is distributed rate limiting across API calls:
+
+```
+Task A (Container 1)              Task B (Container 2)
+    │                                  │
+    ├─> Check: API calls < limit?     ├─> Check: API calls < limit?
+    │   └─> Redis GET counter         │   └─> Redis GET counter
+    │                                  │
+    ├─> If OK: Increment counter      ├─> If OK: Increment counter
+    │   └─> Redis INCR counter        │   └─> Redis INCR counter
+    │                                  │
+    └─> Make API call                 └─> Make API call
+            │                              │
+            ▼                              ▼
+    Both tasks coordinate through Redis to respect rate limits
+            │
+            ▼
+    (Optional) Export logs to data warehouse for analytics
+```
+
+This pattern ensures that multiple tasks running simultaneously never exceed rate limits, regardless of how many containers are active at once.
 
 ## License
 

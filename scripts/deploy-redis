@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+#
+# Deploy Redis to K3s for distributed rate limiting
+#
+# Usage:
+#   ./scripts/deploy-redis
+#   ./scripts/deploy-redis --status
+#   ./scripts/deploy-redis --teardown
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Source common functions
+# shellcheck source=lib/_common.sh
+source "${SCRIPT_DIR}/lib/_common.sh"
+
+# Load environment
+load_env
+
+# Configuration
+NAMESPACE="${AIRFLOW_NAMESPACE:-airflow}"
+REDIS_MANIFEST="${PROJECT_ROOT}/k8s/redis.yaml"
+
+#######################################
+# Deploy Redis to Kubernetes
+#######################################
+deploy_redis() {
+  echo
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log_info "  Deploying Redis for Rate Limiting"
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo
+
+  # Check if namespace exists
+  if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    log_warn "Namespace '${NAMESPACE}' not found. Creating..."
+    kubectl create namespace "${NAMESPACE}"
+  fi
+
+  # Apply Redis manifest
+  log_info "Applying Redis manifest..."
+  kubectl apply -f "${REDIS_MANIFEST}"
+
+  # Wait for Redis to be ready
+  log_info "Waiting for Redis pod to be ready..."
+  if ! kubectl wait --for=condition=ready pod \
+    -l app=redis \
+    -n "${NAMESPACE}" \
+    --timeout=180s; then
+    log_error "Redis failed to become ready"
+    log_info "Check pod status: kubectl get pods -n ${NAMESPACE}"
+    log_info "Check pod logs: kubectl logs -l app=redis -n ${NAMESPACE}"
+    exit 1
+  fi
+
+  echo
+  log_success "Redis deployed successfully!"
+  echo
+
+  # Display connection information
+  print_connection_info
+}
+
+#######################################
+# Display Redis connection information
+#######################################
+print_connection_info() {
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log_info "  Redis Connection Information"
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo
+  
+  log_success "Internal connection (from pods):"
+  echo "  Host: redis.${NAMESPACE}.svc.cluster.local"
+  echo "  Port: 6379"
+  echo "  URL:  redis://redis.${NAMESPACE}.svc.cluster.local:6379"
+  echo
+  
+  log_success "Environment variables (for Python):"
+  echo "  REDIS_HOST=redis.${NAMESPACE}.svc.cluster.local"
+  echo "  REDIS_PORT=6379"
+  echo
+  
+  log_success "External access (NodePort - debugging only):"
+  local node_ip
+  node_ip=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+  echo "  Host: ${node_ip}"
+  echo "  Port: 30379"
+  echo
+  
+  log_info "Testing connection:"
+  echo "  # From inside cluster:"
+  echo "  kubectl run redis-test --rm -i --tty --image redis:7.4-alpine \\"
+  echo "    -n ${NAMESPACE} -- redis-cli -h redis.${NAMESPACE}.svc.cluster.local ping"
+  echo
+  echo "  # From your machine (requires NodePort):"
+  echo "  redis-cli -h ${node_ip} -p 30379 ping"
+  echo
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+#######################################
+# Check Redis status
+#######################################
+check_redis_status() {
+  echo
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log_info "  Redis Status"
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo
+
+  # Check pod status
+  log_info "Pod Status:"
+  kubectl get pods -l app=redis -n "${NAMESPACE}"
+  echo
+
+  # Check service
+  log_info "Service Status:"
+  if kubectl get svc redis -n "${NAMESPACE}" 2>/dev/null; then
+    :
+  else
+    log_warn "Service not found"
+  fi
+  echo
+
+  # Check PVC
+  log_info "Storage Status:"
+  if kubectl get pvc redis-pvc -n "${NAMESPACE}" 2>/dev/null; then
+    :
+  else
+    log_warn "PVC not found"
+  fi
+  echo
+
+  # Test connectivity
+  log_info "Testing connectivity..."
+  if kubectl run redis-test --rm -i --tty --quiet --restart=Never \
+    --image=redis:7.4-alpine \
+    -n "${NAMESPACE}" \
+    -- redis-cli -h redis.${NAMESPACE}.svc.cluster.local ping 2>/dev/null | grep -q "PONG"; then
+    log_success "Redis is responding to PING"
+  else
+    log_error "Redis is not responding"
+  fi
+  echo
+
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+#######################################
+# Teardown Redis
+#######################################
+teardown_redis() {
+  echo
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log_info "  Removing Redis"
+  log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo
+
+  log_warn "This will remove Redis and all its data!"
+  read -p "Are you sure? (yes/no): " confirm
+
+  if [[ "${confirm}" != "yes" ]]; then
+    log_warn "Aborted."
+    exit 0
+  fi
+
+  log_info "Deleting Redis resources..."
+  kubectl delete -f "${REDIS_MANIFEST}" --ignore-not-found=true
+
+  log_success "Redis removed successfully"
+}
+
+#######################################
+# Show usage
+#######################################
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Deploy Redis to K3s for distributed rate limiting.
+
+OPTIONS:
+  --status      Check Redis status
+  --teardown    Remove Redis deployment
+  -h, --help    Show this help message
+
+EXAMPLES:
+  # Deploy Redis
+  $(basename "$0")
+
+  # Check status
+  $(basename "$0") --status
+
+  # Remove Redis
+  $(basename "$0") --teardown
+
+EOF
+}
+
+#######################################
+# Main
+#######################################
+main() {
+  local action="deploy"
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    --status)
+      action="status"
+      shift
+      ;;
+    --teardown)
+      action="teardown"
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      log_error "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+    esac
+  done
+
+  # Require kubectl
+  require_command kubectl
+
+  # Execute action
+  case "${action}" in
+  deploy)
+    deploy_redis
+    ;;
+  status)
+    check_redis_status
+    ;;
+  teardown)
+    teardown_redis
+    ;;
+  esac
+}
+
+main "$@"
+
+
