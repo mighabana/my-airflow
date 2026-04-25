@@ -50,6 +50,7 @@ load_env() {
     # Set defaults for any missing variables
     export AIRFLOW_NAMESPACE="${AIRFLOW_NAMESPACE:-airflow}"
     export AIRFLOW_VERSION="${AIRFLOW_VERSION:-2.8.1}"
+    export PROJECT_ROOT="${PROJECT_ROOT}"
     export VOLUMES_PATH="${VOLUMES_PATH:-${PROJECT_ROOT}/volumes}"
     export WEBSERVER_PORT="${WEBSERVER_PORT:-30080}"
     export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-airflow}"

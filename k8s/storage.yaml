@@ -19,7 +19,7 @@ spec:
     namespace: ${AIRFLOW_NAMESPACE}
     name: airflow-dags-pvc
   hostPath:
-    path: ${VOLUMES_PATH}/dags
+    path: ${PROJECT_ROOT}/dags
     type: DirectoryOrCreate
 
 ---
