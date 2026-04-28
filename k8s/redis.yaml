@@ -161,4 +161,4 @@ spec:
     protocol: TCP
     name: redis
   selector:
-    app: redist
+    app: redis
